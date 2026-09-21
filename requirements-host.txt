@@ -1,0 +1,15 @@
+# Relaxed host-driver requirements for Python 3.13 (originals in requirements.txt
+# pin versions with no wheels for 3.13). The host driver only orchestrates Docker,
+# loads HDF5 datasets, and computes recall/qps metrics; modern versions are fine.
+ansicolors>=1.1.8
+docker>=6.1.3
+h5py>=3.11
+matplotlib>=3.8
+numpy>=1.26,<2.2
+pyyaml>=6.0
+psutil>=5.9.4
+scikit-learn>=1.4
+jinja2>=3.1.2
+pytest>=7.2.2
+datasets>=2.12.0
+pymysql>=1.1  # villagesql adapter (local runs talk the MySQL protocol)

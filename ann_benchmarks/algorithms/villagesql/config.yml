@@ -1,0 +1,16 @@
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: VillageSQL
+    disabled: false
+    docker_tag: ann-benchmarks-villagesql
+    module: ann_benchmarks.algorithms.villagesql
+    name: villagesql
+    run_groups:
+      normal:
+        # M / ef_construction control graph build (both tunable in vsql_vector,
+        # unlike MariaDB's fixed ef_construction). ef_search (query_args) is the
+        # per-query search breadth.
+        arg_groups: [{M: [8, 16, 32], ef_construction: [64, 128, 200]}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200]]
