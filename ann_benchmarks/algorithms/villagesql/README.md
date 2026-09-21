@@ -17,7 +17,7 @@ used.
 | Index | inline `VECTOR INDEX (v)` in `CREATE TABLE` | separate `CREATE INDEX idx_v ON t (v hnsw_l2) USING EXTENDED(hnsw) WITH (M=…, ef_construction=…)` |
 | Query breadth | `SET mhnsw_ef_search = N` | `SET vsql_vector.ef_search = N` |
 | ef_construction | fixed (10) | tunable |
-| Extra gates | none | `SET PERSIST vsql_allow_preview_extensions = ON`, `SET GLOBAL optimizer_switch='hypergraph_optimizer=on'`, `INSTALL EXTENSION vsql_vector` |
+| Extra gates | none | `SET PERSIST vsql_allow_preview_extensions = ON`, `INSTALL EXTENSION vsql_vector` (optimizer stays **classic**) |
 
 The HNSW index is created **before** inserting so the graph builds
 incrementally as rows arrive (vsql_vector's natural path); the insert phase is
