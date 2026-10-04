@@ -37,10 +37,8 @@ from ..base.module import BaseANN
 #     agree.
 #   * Query-time search breadth is SET vsql_vector.ef_search = N (a session
 #     variable registered by the extension), not mhnsw_ef_search.
-#   * Two server-side gates are required for the custom KNN path: preview
-#     extensions must be allowed (to INSTALL the preview extension) and the
-#     hypergraph optimizer must be on (the classic optimizer will not select
-#     the custom index scan).
+#   * One server-side gate is required: preview extensions must be allowed, to
+#     INSTALL the preview extension. The optimizer stays CLASSIC.
 
 # Metric -> (index modifier used at build time, distance function used at query
 # time, sort order). The modifier and the distance function must name the same
@@ -366,7 +364,6 @@ class VillageSQL(BaseANN):
         gate = pymysql.connect(unix_socket=self._socket_file, user="root")
         gcur = gate.cursor()
         gcur.execute("SET PERSIST vsql_allow_preview_extensions = ON")
-        gcur.execute("SET GLOBAL optimizer_switch = 'hypergraph_optimizer=on'")
         try:
             gcur.execute("INSTALL EXTENSION vsql_vector")
         except pymysql.Error as e:
@@ -375,9 +372,6 @@ class VillageSQL(BaseANN):
         gate.close()
 
     def fit(self, X):
-        # Enable the custom KNN path on the harness's own connection too.
-        self._cur.execute("SET optimizer_switch = 'hypergraph_optimizer=on'")
-
         print("\nPreparing database and table...")
         self._cur.execute("DROP DATABASE IF EXISTS ann")
         self._cur.execute("CREATE DATABASE ann")
