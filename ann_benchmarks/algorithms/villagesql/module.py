@@ -121,6 +121,21 @@ class VillageSQL(BaseANN):
         conn = pymysql.connect(unix_socket=self._socket_file, user="root")
         self._cur = conn.cursor()
 
+    @staticmethod
+    def buffer_pool_size():
+        """Buffer pool to request, capped to something this machine can map."""
+        explicit = os.environ.get('VILLAGESQL_BUFFER_POOL')
+        if explicit:
+            return explicit
+        try:
+            total = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+        except (ValueError, OSError, AttributeError):
+            return "4G"
+        # Half of RAM, clamped to [1G, 26G]: enough to hold these datasets
+        # entirely while leaving room for the OS and the benchmark client.
+        gb = max(1, min(26, int(total * 0.5) // (1024 ** 3)))
+        return f"{gb}G"
+
     def prepare_options(self):
         self._perf_stat = os.environ.get('PERF', 'no') == 'yes' and VillageSQL.can_run_perf()
         self._perf_record = os.environ.get('FLAMEGRAPH', 'no') == 'yes' and VillageSQL.can_run_flamegraph()
@@ -206,10 +221,13 @@ class VillageSQL(BaseANN):
             "--skip-networking",
             "--secure-file-priv=",
             # villagesql's HNSW graph is served from the InnoDB buffer pool (it
-            # has no separate graph cache), so size the pool to match the total
-            # memory MariaDB's adapter gets: 16G buffer pool + 10G MHNSW cache =
-            # 26G. Keeps the two engines on an equal memory budget.
-            "--loose-innodb-buffer-pool-size=26G",
+            # has no separate graph cache), so the pool must hold the whole
+            # table + graph. The reference budget is what MariaDB's adapter
+            # gets (16G pool + 10G MHNSW cache = 26G), but it must be capped to
+            # the machine: requesting more than physical RAM makes InnoDB spin
+            # at startup and never reach "ready for connections", and --loose-
+            # hides it. Override with VILLAGESQL_BUFFER_POOL to force a size.
+            f"--loose-innodb-buffer-pool-size={VillageSQL.buffer_pool_size()}",
             # Large redo log so the 60k-vector build's write burst does not
             # trigger checkpoint stalls (default is ~100MB). Matched with the
             # MariaDB adapter's innodb_log_file_size=2G.
