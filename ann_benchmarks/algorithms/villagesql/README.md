@@ -13,7 +13,7 @@ used.
 |---|---|---|
 | Driver | `mariadb` connector | `pymysql` (MySQL protocol) |
 | Column | `VECTOR(N)` | `SVECTOR(N)` on `ENGINE=InnoDB` |
-| Value format | raw float32 bytes | text literal `'[f0,f1,...]'` |
+| Value format | raw float32 bytes | text literal `'[f0,f1,...]'`; binary form optional |
 | Index | inline `VECTOR INDEX (v)` in `CREATE TABLE` | separate `CREATE INDEX idx_v ON t (v hnsw_l2) USING EXTENDED(hnsw) WITH (M=…, ef_construction=…)` |
 | Query breadth | `SET mhnsw_ef_search = N` | `SET vsql_vector.ef_search = N` |
 | ef_construction | fixed (10) | tunable |
@@ -74,6 +74,7 @@ M×ef_construction combo, one pass).
 | `VILLAGESQL_DB_WORKSPACE` | Scratch dir for the datadir and error log. Required. |
 | `VSQL_VECTOR_VEB` | Path to the `vsql_vector.veb` to benchmark; copied into the server's `veb_output_directory` on startup. Optional — if unset, the VEB already in the server tree is used. |
 | `DO_INIT_VILLAGESQL` | `yes` (default) initializes a fresh datadir with `--initialize-insecure`. Set `no` if the datadir is pre-initialized. |
+| `VILLAGESQL_VECTOR_ENCODING` | How vectors are sent: `text` (default, the decimal `'[f0,f1,...]'` literal) or `binary` (SVECTOR's binary form). Set `binary` to measure what the binary form saves. |
 
 **Datadir wipe safety.** `--initialize-insecure` refuses a non-empty datadir, and
 each M/ef_construction combo re-initializes, so the adapter wipes
@@ -87,6 +88,24 @@ scratch directory.
 | `PERF` / `FLAMEGRAPH` | `yes` to attach `perf stat` / generate a flame graph around insert/index/search phases (Linux only). |
 
 ## Notes
+
+- **Vector wire format.** Vectors are sent as the decimal `'[f0,f1,...]'`
+  literal by default, matching how the adapter started. SVECTOR also accepts a
+  binary form — a 2-byte big-endian element count with its high bit set,
+  followed by the little-endian float32 elements — which is far cheaper to
+  build client-side and can otherwise dominate per-query cost. The high bit is
+  what marks the value as binary: a decimal literal is ASCII and always begins
+  below `0x80`, so the two forms are distinguishable on the first byte alone.
+  The extension's `tools/client_encode_bench.py` measures the difference, and
+  `VILLAGESQL_VECTOR_ENCODING=binary` runs the whole benchmark on the binary
+  form for an end-to-end comparison.
+
+  PyMySQL has no binary-protocol/prepared-statement path, so the bytes go as a
+  `_binary X'..'` hex literal — twice the wire payload of the raw bytes
+  MariaDB's connector sends over the binary protocol. The client-CPU win is
+  captured; wire parity with MariaDB would need a binary-protocol driver
+  (`mysqlclient` or `mysql-connector-python`) and a server-side `from_binary`
+  hook.
 
 - Only `euclidean` and `angular` (→ cosine) metrics are wired up, matching the
   blog's datasets. Add rows to `_METRICS` in `module.py` for L1 / inner product.

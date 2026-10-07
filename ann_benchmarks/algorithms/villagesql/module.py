@@ -3,6 +3,7 @@ import glob
 import os
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -49,10 +50,48 @@ _METRICS = {
 }
 
 
+# How a vector is handed to the server. Both forms produce a complete SQL
+# fragment, so call sites interpolate them identically.
+#
+#   text    the decimal literal '[f0,f1,...]'.
+#   binary  the SVECTOR binary form: a 2-byte big-endian element count with its
+#           high bit set, then the little-endian float32 elements. Much cheaper
+#           to build client-side than a decimal literal, whose cost can
+#           dominate a query. Sent as _binary X'..' rather than a %s parameter
+#           because PyMySQL escapes a bytes parameter to a bare X'..', which is
+#           coerced via the connection charset and truncates at the first NUL.
+#
+# Set VILLAGESQL_VECTOR_ENCODING to pick one; text is the default. Switching it
+# is how the two encodings are compared without touching any call site.
+VECTOR_ENCODING = os.environ.get('VILLAGESQL_VECTOR_ENCODING', 'text')
+
+
+def _vector_to_text_literal(v):
+    # Quoted so it drops into SQL exactly as the binary form does. Full
+    # float32 precision.
+    return "'[" + ",".join(repr(float(x)) for x in v) + "]'"
+
+
+def _vector_to_binary_literal(v):
+    a = numpy.asarray(v, '<f4')
+    header = struct.pack('>H', a.size | 0x8000)
+    return "_binary X'" + header.hex() + a.tobytes().hex() + "'"
+
+
+_VECTOR_ENCODERS = {
+    'text': _vector_to_text_literal,
+    'binary': _vector_to_binary_literal,
+}
+
+if VECTOR_ENCODING not in _VECTOR_ENCODERS:
+    raise RuntimeError(
+        f"VILLAGESQL_VECTOR_ENCODING={VECTOR_ENCODING!r} is not one of "
+        f"{sorted(_VECTOR_ENCODERS)}")
+
+
 def vector_to_literal(v):
-    # SVECTOR accepts a bracketed text literal; a plain repr of the float list
-    # is enough. Keep full float32 precision.
-    return "[" + ",".join(repr(float(x)) for x in v) + "]"
+    """Render a vector as a SQL fragment in the configured encoding."""
+    return _VECTOR_ENCODERS[VECTOR_ENCODING](v)
 
 
 def many_inserts(arg):
@@ -66,8 +105,9 @@ def many_inserts(arg):
     for i, embedding in enumerate(embeddings):
         while True:
             try:
-                cur.execute("INSERT INTO t1 (id, v) VALUES (%s, %s)",
-                            (i + base, vector_to_literal(embedding)))
+                cur.execute(
+                    f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
+                    (i + base,))
                 break
             except pymysql.OperationalError:
                 time.sleep(0.01 * (11 + base * 17 % 13))
@@ -86,7 +126,7 @@ def many_queries(arg):
     res = []
     for v in queries:
         cur.execute(
-            f"SELECT id FROM t1 ORDER BY {dist_fn}(v, '{vector_to_literal(v)}') {order} LIMIT {n}")
+            f"SELECT id FROM t1 ORDER BY {dist_fn}(v, {vector_to_literal(v)}) {order} LIMIT {n}")
         res.append([row[0] for row in cur.fetchall()])
     return res
 
@@ -423,8 +463,9 @@ class VillageSQL(BaseANN):
         else:
             rps, rows, last, total = 1000, 0, time.time(), 1
             for i, embedding in enumerate(X):
-                self._cur.execute("INSERT INTO t1 (id, v) VALUES (%s, %s)",
-                                  (i, vector_to_literal(embedding)))
+                self._cur.execute(
+                    f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
+                    (i,))
                 if i - rows > rps:
                     now = time.time()
                     rps = ((i - rows) / (now - last) + 19 * rps) / 20
@@ -449,7 +490,7 @@ class VillageSQL(BaseANN):
 
     def query(self, v, n):
         self._cur.execute(
-            f"SELECT id FROM t1 ORDER BY {self._dist_fn}(v, '{vector_to_literal(v)}') {self._order} LIMIT {n}")
+            f"SELECT id FROM t1 ORDER BY {self._dist_fn}(v, {vector_to_literal(v)}) {self._order} LIMIT {n}")
         return [row[0] for row in self._cur.fetchall()]
 
     def get_memory_usage(self):
