@@ -75,7 +75,8 @@ M×ef_construction combo, one pass).
 | `VSQL_VECTOR_VEB` | Path to the `vsql_vector.veb` to benchmark; copied into the server's `veb_output_directory` on startup. Optional — if unset, the VEB already in the server tree is used. |
 | `DO_INIT_VILLAGESQL` | `yes` (default) initializes a fresh datadir with `--initialize-insecure`. Set `no` if the datadir is pre-initialized. |
 | `VILLAGESQL_VECTOR_ENCODING` | How vectors are sent: `text` (default, the decimal `'[f0,f1,...]'` literal) or `binary` (SVECTOR's binary form). Set `binary` to measure what the binary form saves. |
-| `VILLAGESQL_USE_PREPARED` | `no` (default) builds a fresh SQL string per row; `yes` prepares the per-vector INSERT and SELECT once and binds the vector as a parameter. Needs `mysql-connector-python`. Independent of the encoding above, so all four combinations are valid. |
+| `VILLAGESQL_DRIVER` | Client library: `pymysql` (default), `connector` (`mysql-connector-python`), or `mariadb` (MariaDB Connector/Python, what the `mariadb` adapter here uses). Separate from the knob below so the library's cost can be measured apart from prepared statements. |
+| `VILLAGESQL_USE_PREPARED` | `no` (default) builds a fresh SQL string per row; `yes` prepares the per-vector INSERT and SELECT once and binds the vector as a parameter. Needs `connector` or `mariadb`. |
 
 **Datadir wipe safety.** `--initialize-insecure` refuses a non-empty datadir, and
 each M/ef_construction combo re-initializes, so the adapter wipes
@@ -107,12 +108,31 @@ scratch directory.
   MariaDB's connector sends over the binary protocol. The client-CPU win is
   captured, but not wire parity.
 
-- **Prepared statements.** `VILLAGESQL_USE_PREPARED=yes` switches to
-  `mysql-connector-python` and prepares the per-vector INSERT and SELECT once,
-  binding the vector as a parameter rather than rebuilding the statement text
-  per row. This is a separate dimension from the encoding, so the four
-  combinations measure different things: whether statement reuse helps, and
-  whether the encoding does, without conflating the two.
+- **Prepared statements, and the driver.** `VILLAGESQL_USE_PREPARED=yes`
+  prepares the per-vector INSERT and SELECT once and binds the vector as a
+  parameter, rather than rebuilding the statement text per row.
+
+  It needs a driver that can prepare, which PyMySQL cannot. That makes the two
+  knobs easy to confound: a run that varies only `USE_PREPARED` also changes
+  the client library, and the library's own per-query cost can be larger than
+  anything prepared statements save. Vary one at a time instead --
+
+  | driver | prepared | measures |
+  |---|---|---|
+  | `pymysql` | `no` | the baseline |
+  | `connector` | `no` | that library, on its own |
+  | `connector` | `yes` | prepared statements, on their own |
+  | `mariadb` | `no` | that library, on its own |
+  | `mariadb` | `yes` | prepared statements on the client MariaDB's own adapter uses |
+
+  The last two are the like-for-like comparison against MariaDB's published
+  numbers, since the `mariadb` adapter in this repo uses that same client.
+  Note its `execute()` is already a prepare-and-execute, so `no` there means
+  "statement text rebuilt per row", not "not prepared at the protocol level".
+
+  The startup banner prints which driver and encoding a run used, including
+  whether `mysql-connector-python` is running its C extension or the
+  substantially slower pure-Python implementation.
 
   The vector still carries its `0x8000` tag in this mode. Connector/Python
   declares a `bytes` parameter as `FieldType.STRING`, so the value arrives in

@@ -61,16 +61,43 @@ _METRICS = {
 # Set VILLAGESQL_VECTOR_ENCODING to pick one; text is the default.
 VECTOR_ENCODING = os.environ.get('VILLAGESQL_VECTOR_ENCODING', 'text')
 
-# Whether statements are prepared once and re-executed, instead of being built
-# as a fresh SQL string per row. Set VILLAGESQL_USE_PREPARED=yes to turn it on;
-# off is the default. It is deliberately independent of the encoding above so
-# the two can be measured separately -- the 4 combinations are all valid.
+# Which client library to talk to the server with. Set VILLAGESQL_DRIVER:
 #
-# Prepared mode needs a driver that speaks the binary protocol. PyMySQL and
-# mysqlclient have no prepared-statement path at all (both interpolate
-# parameters into the SQL text), so it uses mysql-connector-python's
-# cursor(prepared=True).
+#   pymysql    PyMySQL, the default. Text protocol only, so no prepared
+#              statements.
+#   connector  mysql-connector-python. Can prepare statements.
+#   mariadb    MariaDB Connector/Python, which is what the mariadb adapter in
+#              this repo uses, so it is the like-for-like client for comparing
+#              against MariaDB's own numbers. Prepares by default (its
+#              execute() is a prepare-and-execute) and uses ? placeholders
+#              rather than %s. Needs libmariadb-dev to install.
+#
+# This is a separate knob from VILLAGESQL_USE_PREPARED on purpose. PyMySQL has
+# no prepared-statement path, so turning prepared statements on also changes
+# the client library, and a run that varied only USE_PREPARED would measure the
+# two together. Holding the driver fixed and varying USE_PREPARED measures
+# prepared statements alone; holding USE_PREPARED at no and varying the driver
+# measures the library alone.
+DRIVER = os.environ.get('VILLAGESQL_DRIVER', 'pymysql')
+
+# Whether the per-vector statements are prepared once and re-executed, instead
+# of being built as a fresh SQL string per row.
 USE_PREPARED = os.environ.get('VILLAGESQL_USE_PREPARED', 'no') == 'yes'
+
+_DRIVERS = ('pymysql', 'connector', 'mariadb')
+_PREPARING_DRIVERS = ('connector', 'mariadb')
+
+# The placeholder each driver's paramstyle wants. Only matters where a value is
+# bound rather than interpolated, i.e. in prepared mode.
+PLACEHOLDER = '?' if DRIVER == 'mariadb' else '%s'
+
+if DRIVER not in _DRIVERS:
+    raise RuntimeError(
+        f"VILLAGESQL_DRIVER={DRIVER!r} is not one of {sorted(_DRIVERS)}")
+if USE_PREPARED and DRIVER not in _PREPARING_DRIVERS:
+    raise RuntimeError(
+        f"VILLAGESQL_USE_PREPARED=yes needs one of "
+        f"{sorted(_PREPARING_DRIVERS)}; {DRIVER!r} cannot prepare statements")
 
 
 def _vector_to_text_literal(v):
@@ -131,24 +158,55 @@ def vector_to_value(v):
     return _VECTOR_VALUES[VECTOR_ENCODING](v)
 
 
-if USE_PREPARED:
+# The concurrent insert workers retry on a transient failure (lock wait,
+# deadlock); each driver raises its own type for those.
+if DRIVER == 'connector':
     import mysql.connector
-    # The concurrent insert workers retry on a transient failure (lock wait,
-    # deadlock); each driver raises its own type for those.
     RETRY_ERRORS = (mysql.connector.errors.OperationalError,
                     mysql.connector.errors.DatabaseError)
+elif DRIVER == 'mariadb':
+    try:
+        import mariadb
+    except ImportError as e:
+        raise RuntimeError(
+            "VILLAGESQL_DRIVER=mariadb needs MariaDB Connector/Python, which "
+            "builds against libmariadb: apt-get install libmariadb-dev, then "
+            f"pip install mariadb ({e})") from e
+    RETRY_ERRORS = (mariadb.OperationalError, mariadb.DatabaseError)
 else:
     RETRY_ERRORS = (pymysql.OperationalError,)
 
 
+def driver_info():
+    """How the chosen driver is actually talking to the server.
+
+    Reported so a run's numbers can be attributed: mysql-connector-python ships
+    a C extension and a pure-Python implementation, and the pure one is
+    substantially slower, so which is in use has to be recorded rather than
+    assumed.
+    """
+    prepared = 'yes' if USE_PREPARED else 'no'
+    if DRIVER == 'connector':
+        impl = 'C extension' if mysql.connector.HAVE_CEXT else 'pure Python'
+        return (f"mysql-connector-python {mysql.connector.__version__} "
+                f"({impl}), prepared={prepared}")
+    if DRIVER == 'mariadb':
+        return (f"mariadb {mariadb.__version__} "
+                f"(C ext over libmariadb), prepared={prepared}")
+    return f"pymysql {pymysql.__version__}, prepared={prepared}"
+
+
 def connect(socket_file):
-    """Open a connection with whichever driver the current mode needs."""
-    if not USE_PREPARED:
-        return pymysql.connect(unix_socket=socket_file, user="root")
-    # autocommit so the insert loop behaves as it does under PyMySQL, which
-    # leaves autocommit on by default.
-    return mysql.connector.connect(unix_socket=socket_file, user="root",
-                                   autocommit=True)
+    """Open a connection with the configured driver."""
+    # autocommit on the prepared-capable drivers so the insert loop behaves as
+    # it does under PyMySQL, which leaves autocommit on by default.
+    if DRIVER == 'connector':
+        return mysql.connector.connect(unix_socket=socket_file, user="root",
+                                       autocommit=True)
+    if DRIVER == 'mariadb':
+        return mariadb.connect(unix_socket=socket_file, user="root",
+                               autocommit=True)
+    return pymysql.connect(unix_socket=socket_file, user="root")
 
 
 def vector_cursor(conn):
@@ -160,8 +218,14 @@ def vector_cursor(conn):
     connector that leaves an unread result behind and breaks the connection,
     so the INSERT and the SELECT need one of these each. Anything else (USE,
     SET, DDL, commit) goes through plain_cursor().
+
+    MariaDB Connector/Python has no prepared=True: its execute() is already a
+    prepare-and-execute that caches the handle on the cursor, so an ordinary
+    cursor is the prepared one and the same single-statement rule applies.
     """
-    return conn.cursor(prepared=True) if USE_PREPARED else conn.cursor()
+    if not USE_PREPARED or DRIVER == 'mariadb':
+        return conn.cursor()
+    return conn.cursor(prepared=True)
 
 
 def plain_cursor(conn):
@@ -181,11 +245,14 @@ def many_inserts(arg):
         while True:
             try:
                 if USE_PREPARED:
-                    cur.execute("INSERT INTO t1 (id, v) VALUES (%s, %s)",
-                                (i + base, vector_to_value(embedding)))
+                    cur.execute(
+                        f"INSERT INTO t1 (id, v) VALUES "
+                        f"({PLACEHOLDER}, {PLACEHOLDER})",
+                        (i + base, vector_to_value(embedding)))
                 else:
                     cur.execute(
-                        f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
+                        f"INSERT INTO t1 (id, v) VALUES "
+                        f"({PLACEHOLDER}, {vector_to_literal(embedding)})",
                         (i + base,))
                 break
             except RETRY_ERRORS:
@@ -207,7 +274,8 @@ def many_queries(arg):
     for v in queries:
         if USE_PREPARED:
             cur.execute(
-                f"SELECT id FROM t1 ORDER BY {dist_fn}(v, %s) {order} LIMIT {n}",
+                f"SELECT id FROM t1 ORDER BY {dist_fn}(v, {PLACEHOLDER}) "
+                f"{order} LIMIT {n}",
                 (vector_to_value(v),))
         else:
             cur.execute(
@@ -333,7 +401,9 @@ class VillageSQL(BaseANN):
         print(f"VILLAGESQL_ROOT_DIR: {root_dir}")
         print(f"DATA_DIR: {self._data_dir}")
         print(f"LOG_FILE: {self._log_file}")
-        print(f"SOCKET_FILE: {self._socket_file}\n")
+        print(f"SOCKET_FILE: {self._socket_file}")
+        print(f"DRIVER: {driver_info()}")
+        print(f"VECTOR_ENCODING: {VECTOR_ENCODING}\n")
 
         # Command to initialize a fresh datadir (insecure = no root password).
         self._init_cmd = [
@@ -565,11 +635,13 @@ class VillageSQL(BaseANN):
             for i, embedding in enumerate(X):
                 if USE_PREPARED:
                     self._ins_cur.execute(
-                        "INSERT INTO t1 (id, v) VALUES (%s, %s)",
+                        f"INSERT INTO t1 (id, v) VALUES "
+                        f"({PLACEHOLDER}, {PLACEHOLDER})",
                         (i, vector_to_value(embedding)))
                 else:
                     self._ins_cur.execute(
-                        f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
+                        f"INSERT INTO t1 (id, v) VALUES "
+                        f"({PLACEHOLDER}, {vector_to_literal(embedding)})",
                         (i,))
                 if i - rows > rps:
                     now = time.time()
@@ -601,7 +673,8 @@ class VillageSQL(BaseANN):
             self._qry_cur = vector_cursor(self._conn)
         if USE_PREPARED:
             self._qry_cur.execute(
-                f"SELECT id FROM t1 ORDER BY {self._dist_fn}(v, %s) {self._order} LIMIT {n}",
+                f"SELECT id FROM t1 ORDER BY "
+                f"{self._dist_fn}(v, {PLACEHOLDER}) {self._order} LIMIT {n}",
                 (vector_to_value(v),))
         else:
             self._qry_cur.execute(

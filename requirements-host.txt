@@ -13,4 +13,7 @@ jinja2>=3.1.2
 pytest>=7.2.2
 datasets>=2.12.0
 pymysql>=1.1  # villagesql adapter (local runs talk the MySQL protocol)
-mysql-connector-python>=9.0  # villagesql adapter, VILLAGESQL_USE_PREPARED=yes only
+mysql-connector-python>=9.0  # villagesql adapter, VILLAGESQL_DRIVER=connector only
+# VILLAGESQL_DRIVER=mariadb additionally needs MariaDB Connector/Python, left
+# out here because it builds against libmariadb (apt-get install libmariadb-dev
+# first). The mariadb adapter's own Dockerfile installs it the same way.
