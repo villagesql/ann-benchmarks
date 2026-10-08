@@ -50,20 +50,27 @@ _METRICS = {
 }
 
 
-# How a vector is handed to the server. Both forms produce a complete SQL
-# fragment, so call sites interpolate them identically.
+# How a vector is handed to the server.
 #
 #   text    the decimal literal '[f0,f1,...]'.
 #   binary  the SVECTOR binary form: a 2-byte big-endian element count with its
 #           high bit set, then the little-endian float32 elements. Much cheaper
 #           to build client-side than a decimal literal, whose cost can
-#           dominate a query. Sent as _binary X'..' rather than a %s parameter
-#           because PyMySQL escapes a bytes parameter to a bare X'..', which is
-#           coerced via the connection charset and truncates at the first NUL.
+#           dominate a query.
 #
-# Set VILLAGESQL_VECTOR_ENCODING to pick one; text is the default. Switching it
-# is how the two encodings are compared without touching any call site.
+# Set VILLAGESQL_VECTOR_ENCODING to pick one; text is the default.
 VECTOR_ENCODING = os.environ.get('VILLAGESQL_VECTOR_ENCODING', 'text')
+
+# Whether statements are prepared once and re-executed, instead of being built
+# as a fresh SQL string per row. Set VILLAGESQL_USE_PREPARED=yes to turn it on;
+# off is the default. It is deliberately independent of the encoding above so
+# the two can be measured separately -- the 4 combinations are all valid.
+#
+# Prepared mode needs a driver that speaks the binary protocol. PyMySQL and
+# mysqlclient have no prepared-statement path at all (both interpolate
+# parameters into the SQL text), so it uses mysql-connector-python's
+# cursor(prepared=True).
+USE_PREPARED = os.environ.get('VILLAGESQL_USE_PREPARED', 'no') == 'yes'
 
 
 def _vector_to_text_literal(v):
@@ -73,60 +80,138 @@ def _vector_to_text_literal(v):
 
 
 def _vector_to_binary_literal(v):
+    # _binary X'..' rather than a %s parameter because PyMySQL escapes a bytes
+    # parameter to a bare X'..', which is coerced via the connection charset
+    # and truncates at the first NUL.
     a = numpy.asarray(v, '<f4')
     header = struct.pack('>H', a.size | 0x8000)
     return "_binary X'" + header.hex() + a.tobytes().hex() + "'"
 
 
-_VECTOR_ENCODERS = {
+# Prepared mode binds the vector as a parameter instead, so these return a
+# value rather than a SQL fragment: no quoting, no _binary prefix, no hex.
+def _vector_to_text_value(v):
+    return "[" + ",".join(repr(float(x)) for x in v) + "]"
+
+
+def _vector_to_binary_value(v):
+    # Connector/Python declares a bytes parameter as FieldType.STRING, so the
+    # value reaches the server with the connection charset rather than binary
+    # and is handled by the type's string converter. The 0x8000 tag is what
+    # lets that converter recognize it as the binary form, so it is still
+    # required here. (Sending bare bytes to a from_binary hook instead needs
+    # the COM_STMT_SEND_LONG_DATA route, which is a separate experiment.)
+    a = numpy.asarray(v, '<f4')
+    return struct.pack('>H', a.size | 0x8000) + a.tobytes()
+
+
+_VECTOR_FRAGMENTS = {
     'text': _vector_to_text_literal,
     'binary': _vector_to_binary_literal,
 }
 
-if VECTOR_ENCODING not in _VECTOR_ENCODERS:
+_VECTOR_VALUES = {
+    'text': _vector_to_text_value,
+    'binary': _vector_to_binary_value,
+}
+
+if VECTOR_ENCODING not in _VECTOR_FRAGMENTS:
     raise RuntimeError(
         f"VILLAGESQL_VECTOR_ENCODING={VECTOR_ENCODING!r} is not one of "
-        f"{sorted(_VECTOR_ENCODERS)}")
+        f"{sorted(_VECTOR_FRAGMENTS)}")
 
 
 def vector_to_literal(v):
     """Render a vector as a SQL fragment in the configured encoding."""
-    return _VECTOR_ENCODERS[VECTOR_ENCODING](v)
+    return _VECTOR_FRAGMENTS[VECTOR_ENCODING](v)
+
+
+def vector_to_value(v):
+    """Render a vector as a bound-parameter value in the configured encoding."""
+    return _VECTOR_VALUES[VECTOR_ENCODING](v)
+
+
+if USE_PREPARED:
+    import mysql.connector
+    # The concurrent insert workers retry on a transient failure (lock wait,
+    # deadlock); each driver raises its own type for those.
+    RETRY_ERRORS = (mysql.connector.errors.OperationalError,
+                    mysql.connector.errors.DatabaseError)
+else:
+    RETRY_ERRORS = (pymysql.OperationalError,)
+
+
+def connect(socket_file):
+    """Open a connection with whichever driver the current mode needs."""
+    if not USE_PREPARED:
+        return pymysql.connect(unix_socket=socket_file, user="root")
+    # autocommit so the insert loop behaves as it does under PyMySQL, which
+    # leaves autocommit on by default.
+    return mysql.connector.connect(unix_socket=socket_file, user="root",
+                                   autocommit=True)
+
+
+def vector_cursor(conn):
+    """A cursor for ONE per-vector statement, prepared when that mode is on.
+
+    A prepared cursor prepares on its first execute and reuses the handle
+    after, so it must be long-lived and must run only that one statement.
+    Sending a second statement through it re-prepares, and with the C
+    connector that leaves an unread result behind and breaks the connection,
+    so the INSERT and the SELECT need one of these each. Anything else (USE,
+    SET, DDL, commit) goes through plain_cursor().
+    """
+    return conn.cursor(prepared=True) if USE_PREPARED else conn.cursor()
+
+
+def plain_cursor(conn):
+    """A cursor for one-off statements, never prepared."""
+    return conn.cursor()
 
 
 def many_inserts(arg):
     socket_file, base, embeddings = arg
-    conn = pymysql.connect(unix_socket=socket_file, user="root")
-    cur = conn.cursor()
-    cur.execute("USE ann")
+    conn = connect(socket_file)
+    plain_cursor(conn).execute("USE ann")
+    cur = vector_cursor(conn)
     lenX = len(embeddings)
     start_time = time.time()
     rps = 100
     for i, embedding in enumerate(embeddings):
         while True:
             try:
-                cur.execute(
-                    f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
-                    (i + base,))
+                if USE_PREPARED:
+                    cur.execute("INSERT INTO t1 (id, v) VALUES (%s, %s)",
+                                (i + base, vector_to_value(embedding)))
+                else:
+                    cur.execute(
+                        f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
+                        (i + base,))
                 break
-            except pymysql.OperationalError:
+            except RETRY_ERRORS:
                 time.sleep(0.01 * (11 + base * 17 % 13))
         if base == 0 and (i + 1) % int(rps + 1) == 0:
             rps = i / (time.time() - start_time)
             print(f"{i:6d} of {lenX}, {rps:4.2f} stmt/sec, ETA {(lenX - i) / rps:.0f} sec")
-    cur.execute("commit")
+    plain_cursor(conn).execute("commit")
 
 
 def many_queries(arg):
     socket_file, ef_search, dist_fn, order, n, queries = arg
-    conn = pymysql.connect(unix_socket=socket_file, user="root")
-    cur = conn.cursor()
-    cur.execute("USE ann")
-    cur.execute("SET vsql_vector.ef_search = %s" % ef_search)
+    conn = connect(socket_file)
+    setup = plain_cursor(conn)
+    setup.execute("USE ann")
+    setup.execute("SET vsql_vector.ef_search = %s" % ef_search)
+    cur = vector_cursor(conn)
     res = []
     for v in queries:
-        cur.execute(
-            f"SELECT id FROM t1 ORDER BY {dist_fn}(v, {vector_to_literal(v)}) {order} LIMIT {n}")
+        if USE_PREPARED:
+            cur.execute(
+                f"SELECT id FROM t1 ORDER BY {dist_fn}(v, %s) {order} LIMIT {n}",
+                (vector_to_value(v),))
+        else:
+            cur.execute(
+                f"SELECT id FROM t1 ORDER BY {dist_fn}(v, {vector_to_literal(v)}) {order} LIMIT {n}")
         res.append([row[0] for row in cur.fetchall()])
     return res
 
@@ -158,8 +243,17 @@ class VillageSQL(BaseANN):
         self.initialize_db()
         self.start_db()
 
-        conn = pymysql.connect(unix_socket=self._socket_file, user="root")
-        self._cur = conn.cursor()
+        conn = connect(self._socket_file)
+        # A prepared cursor holds exactly ONE statement: sending a second
+        # statement through it re-prepares, and with the C connector that
+        # leaves an unread result behind and breaks the connection. So the
+        # INSERT and the SELECT each get their own, created lazily on first
+        # use, and everything else (DDL, USE, SET, commit) stays on the plain
+        # cursor.
+        self._conn = conn
+        self._cur = plain_cursor(conn)
+        self._ins_cur = None
+        self._qry_cur = None
 
     @staticmethod
     def buffer_pool_size():
@@ -403,6 +497,10 @@ class VillageSQL(BaseANN):
             print("ERROR: Failed to start VillageSQL server:", e)
             raise
 
+        # Startup probing and the one-off gates below stay on PyMySQL whatever
+        # VILLAGESQL_USE_PREPARED says: nothing here is per-vector, so the
+        # driver makes no difference, and PyMySQL is always installed.
+        #
         # Wait for the socket to accept connections (<=30s).
         start_time = time.time()
         while True:
@@ -462,10 +560,17 @@ class VillageSQL(BaseANN):
             pool.map(many_inserts, XX)
         else:
             rps, rows, last, total = 1000, 0, time.time(), 1
+            if self._ins_cur is None:
+                self._ins_cur = vector_cursor(self._conn)
             for i, embedding in enumerate(X):
-                self._cur.execute(
-                    f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
-                    (i,))
+                if USE_PREPARED:
+                    self._ins_cur.execute(
+                        "INSERT INTO t1 (id, v) VALUES (%s, %s)",
+                        (i, vector_to_value(embedding)))
+                else:
+                    self._ins_cur.execute(
+                        f"INSERT INTO t1 (id, v) VALUES (%s, {vector_to_literal(embedding)})",
+                        (i,))
                 if i - rows > rps:
                     now = time.time()
                     rps = ((i - rows) / (now - last) + 19 * rps) / 20
@@ -489,9 +594,19 @@ class VillageSQL(BaseANN):
         self._cur.execute("SET vsql_vector.ef_search = %s" % ef_search)
 
     def query(self, v, n):
-        self._cur.execute(
-            f"SELECT id FROM t1 ORDER BY {self._dist_fn}(v, {vector_to_literal(v)}) {self._order} LIMIT {n}")
-        return [row[0] for row in self._cur.fetchall()]
+        # n is interpolated rather than bound: it is part of the statement
+        # shape (LIMIT), and ann-benchmarks holds it fixed for a run, so the
+        # prepared handle is still reused across every query.
+        if self._qry_cur is None:
+            self._qry_cur = vector_cursor(self._conn)
+        if USE_PREPARED:
+            self._qry_cur.execute(
+                f"SELECT id FROM t1 ORDER BY {self._dist_fn}(v, %s) {self._order} LIMIT {n}",
+                (vector_to_value(v),))
+        else:
+            self._qry_cur.execute(
+                f"SELECT id FROM t1 ORDER BY {self._dist_fn}(v, {vector_to_literal(v)}) {self._order} LIMIT {n}")
+        return [row[0] for row in self._qry_cur.fetchall()]
 
     def get_memory_usage(self):
         return self._size / 1024  # kB
@@ -512,7 +627,13 @@ class VillageSQL(BaseANN):
         return f"VillageSQL(m={self._m:2d}, ef_construction={self._ef_construction}, ef_search={self._ef_search})"
 
     def done(self):
-        self._cur.execute("shutdown")
+        # The server drops the connection as it shuts down, which some drivers
+        # surface as an error on the statement itself. The process wait below
+        # is what actually confirms it stopped.
+        try:
+            self._cur.execute("shutdown")
+        except Exception as e:
+            print(f"(note: shutdown reported {type(e).__name__}: {e})")
         self._mysqld_proc.wait(300)
         self.perf_stop()
         self.perf_analysis()

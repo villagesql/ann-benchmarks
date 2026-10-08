@@ -75,6 +75,7 @@ M×ef_construction combo, one pass).
 | `VSQL_VECTOR_VEB` | Path to the `vsql_vector.veb` to benchmark; copied into the server's `veb_output_directory` on startup. Optional — if unset, the VEB already in the server tree is used. |
 | `DO_INIT_VILLAGESQL` | `yes` (default) initializes a fresh datadir with `--initialize-insecure`. Set `no` if the datadir is pre-initialized. |
 | `VILLAGESQL_VECTOR_ENCODING` | How vectors are sent: `text` (default, the decimal `'[f0,f1,...]'` literal) or `binary` (SVECTOR's binary form). Set `binary` to measure what the binary form saves. |
+| `VILLAGESQL_USE_PREPARED` | `no` (default) builds a fresh SQL string per row; `yes` prepares the per-vector INSERT and SELECT once and binds the vector as a parameter. Needs `mysql-connector-python`. Independent of the encoding above, so all four combinations are valid. |
 
 **Datadir wipe safety.** `--initialize-insecure` refuses a non-empty datadir, and
 each M/ef_construction combo re-initializes, so the adapter wipes
@@ -100,12 +101,26 @@ scratch directory.
   `VILLAGESQL_VECTOR_ENCODING=binary` runs the whole benchmark on the binary
   form for an end-to-end comparison.
 
-  PyMySQL has no binary-protocol/prepared-statement path, so the bytes go as a
-  `_binary X'..'` hex literal — twice the wire payload of the raw bytes
+  PyMySQL has no prepared-statement path (nor does `mysqlclient` — both
+  interpolate parameters into the SQL text), so in the default mode the bytes
+  go as a `_binary X'..'` hex literal: twice the wire payload of the raw bytes
   MariaDB's connector sends over the binary protocol. The client-CPU win is
-  captured; wire parity with MariaDB would need a binary-protocol driver
-  (`mysqlclient` or `mysql-connector-python`) and a server-side `from_binary`
-  hook.
+  captured, but not wire parity.
+
+- **Prepared statements.** `VILLAGESQL_USE_PREPARED=yes` switches to
+  `mysql-connector-python` and prepares the per-vector INSERT and SELECT once,
+  binding the vector as a parameter rather than rebuilding the statement text
+  per row. This is a separate dimension from the encoding, so the four
+  combinations measure different things: whether statement reuse helps, and
+  whether the encoding does, without conflating the two.
+
+  The vector still carries its `0x8000` tag in this mode. Connector/Python
+  declares a `bytes` parameter as `FieldType.STRING`, so the value arrives in
+  the connection charset and is handled by the type's string converter, which
+  needs the tag to recognize the binary form. Sending bare bytes to a
+  `from_binary` hook instead requires the `COM_STMT_SEND_LONG_DATA` route
+  (a file-like parameter, `use_pure=True`), which costs an extra round trip
+  per value and is left for a separate experiment.
 
 - Only `euclidean` and `angular` (→ cosine) metrics are wired up, matching the
   blog's datasets. Add rows to `_METRICS` in `module.py` for L1 / inner product.
